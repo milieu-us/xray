@@ -1,4 +1,5 @@
 use smallvec::SmallVec;
+use std::cell::{Ref, RefCell};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::{Add, AddAssign, Range};
@@ -54,6 +55,7 @@ pub struct Cursor<T: Item> {
     stack: SmallVec<[(Tree<T>, usize); 16]>,
     summary: T::Summary,
     did_seek: bool,
+    prev_leaf: RefCell<Option<Option<Tree<T>>>>,
 }
 
 #[derive(Eq, PartialEq)]
@@ -327,6 +329,16 @@ impl<T: Item> Tree<T> {
         }
     }
 
+    fn rightmost_leaf<'a, S: NodeStore<T>>(
+        &'a self,
+        db: &'a mut S,
+    ) -> Result<&'a Tree<T>, S::ReadError> {
+        match self.node(db)? {
+            Node::Leaf { .. } => Ok(self),
+            Node::Internal { child_trees, .. } => child_trees.last().unwrap().rightmost_leaf(db),
+        }
+    }
+
     #[cfg(test)]
     pub fn items<S: NodeStore<T>>(&self, db: &mut S) -> Result<Vec<T>, S::ReadError> {
         let mut items = Vec::new();
@@ -411,6 +423,7 @@ impl<T: Item> Cursor<T> {
             stack: SmallVec::new(),
             summary: T::Summary::default(),
             did_seek: false,
+            prev_leaf: RefCell::new(None),
         }
     }
 
@@ -418,6 +431,67 @@ impl<T: Item> Cursor<T> {
         self.did_seek = false;
         self.stack.truncate(0);
         self.summary = T::Summary::default();
+    }
+
+    pub fn prev_item<'a, S: 'a + NodeStore<T>>(
+        &'a self,
+        db: &'a mut S,
+    ) -> Result<Option<Ref<'a, T>>, S::ReadError> {
+        assert!(self.did_seek, "Must seek before calling this method");
+        if let Some((cur_leaf, index)) = self.stack.last() {
+            if *index == 0 {
+                if let Some(prev_leaf) = self.prev_leaf(db)? {
+                    if prev_leaf.node(db).is_ok() {
+                        Ok(Some(Ref::map(prev_leaf, |prev_leaf| {
+                            let prev_leaf = prev_leaf.node(db).unwrap();
+                            prev_leaf.items().last().unwrap()
+                        })))
+                    } else {
+                        Err(prev_leaf.node(db).unwrap_err())
+                    }
+                } else {
+                    Ok(None)
+                }
+            } else {
+                match cur_leaf.node(db)? {
+                    Node::Leaf { items, .. } => Ok(Some(&items[index - 1])),
+                    _ => unreachable!(),
+                }
+            }
+        } else {
+            unimplemented!()
+        }
+    }
+
+    fn prev_leaf<S: NodeStore<T>>(&self, db: &mut S) -> Result<Option<Ref<Tree<T>>>, S::ReadError> {
+        {
+            let mut prev_leaf = self.prev_leaf.borrow_mut();
+            if prev_leaf.is_none() {
+                for (ancestor, index) in self.stack.iter().rev().skip(1) {
+                    if *index != 0 {
+                        let prev_child = match ancestor.node(db)? {
+                            Node::Internal { child_trees, .. } => child_trees[index - 1].clone(),
+                            Node::Leaf { .. } => unreachable!(),
+                        };
+                        *prev_leaf = Some(Some(prev_child.rightmost_leaf(db)?.clone()));
+                        break;
+                    }
+                }
+
+                if prev_leaf.is_none() {
+                    *prev_leaf = Some(None);
+                }
+            }
+        }
+
+        let prev_leaf = self.prev_leaf.borrow();
+        if prev_leaf.as_ref().unwrap().is_some() {
+            Ok(Some(Ref::map(prev_leaf, |prev_leaf| {
+                prev_leaf.as_ref().unwrap().as_ref().unwrap()
+            })))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn item<'a, S: 'a + NodeStore<T>>(
